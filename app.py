@@ -8,7 +8,8 @@ SHEET = "Fluxo de Caixa"
 
 raw  = pd.read_excel(FILE, sheet_name=SHEET, header=None)
 dre  = pd.read_excel(FILE, sheet_name="DRE", header=None)
-lanc = pd.read_excel(FILE, sheet_name="Lançamentos", header=0)
+lanc      = pd.read_excel(FILE, sheet_name="Lançamentos", header=0)
+lanc_real = lanc[lanc["Status"] == "Confirmado"]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -24,15 +25,17 @@ def vals(row, cols):
     return pd.to_numeric(raw.iloc[row, cols], errors="coerce").fillna(0).values.astype(float)
 
 
-# ── Monthly (header row 4) ────────────────────────────────────────────────────
-m_dates, m_cols = get_section(4)
-monthly = pd.DataFrame({
-    "Data":            m_dates,
-    "Entradas":        vals(6, m_cols),
-    "Saídas":          vals(7, m_cols),
-    "Fluxo":           vals(8, m_cols),
-    "Saldo Acumulado": vals(9, m_cols),
-})
+# ── Monthly realizado (somente confirmados, via Lançamentos) ──────────────────
+_m_tmp = lanc_real.copy()
+_m_tmp["_month"] = pd.to_datetime(_m_tmp["Mês"]).dt.to_period("M").dt.to_timestamp()
+_ent_m = _m_tmp[_m_tmp["Tipo"] == "Entrada"].groupby("_month")["Valor"].sum()
+_sai_m = _m_tmp[_m_tmp["Tipo"] == "Saída"].groupby("_month")["Valor"].sum().abs()
+monthly = (
+    pd.DataFrame({"Entradas": _ent_m, "Saídas": _sai_m})
+    .fillna(0).reset_index().rename(columns={"_month": "Data"})
+)
+monthly["Fluxo"]           = monthly["Entradas"] - monthly["Saídas"]
+monthly["Saldo Acumulado"] = monthly["Fluxo"].cumsum()
 
 # ── Daily realizado (header row 18) ──────────────────────────────────────────
 d_dates, d_cols = get_section(18)
@@ -55,14 +58,13 @@ forecast = pd.DataFrame({
 })
 
 # ── DRE ───────────────────────────────────────────────────────────────────────
-dre_header = pd.to_datetime(dre.iloc[4, 1:], errors="coerce")
-dre_mask   = dre_header.notna()
+dre_header    = pd.to_datetime(dre.iloc[4, 1:], errors="coerce")
+dre_mask      = dre_header.notna()
 dre_date_cols = dre.columns[1:][dre_mask.values]
 
-# Last month with actual data
 dre_receita = pd.to_numeric(dre.iloc[5, dre_date_cols], errors="coerce").fillna(0)
-active_cols  = dre_date_cols[dre_receita.values != 0]
-last_col     = active_cols[-1] if len(active_cols) else dre_date_cols[-1]
+active_cols = dre_date_cols[dre_receita.values != 0]
+last_col    = active_cols[-1] if len(active_cols) else dre_date_cols[-1]
 
 _MESES_PT = {1:"Janeiro",2:"Fevereiro",3:"Março",4:"Abril",5:"Maio",6:"Junho",
              7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
@@ -86,28 +88,28 @@ margem_bruta = (lucro_bruto / receita_bruta * 100) if receita_bruta else 0
 margem_liq   = (lucro_liq   / receita_bruta * 100) if receita_bruta else 0
 
 # ── Category breakdown from Lançamentos ──────────────────────────────────────
-rec_cats  = (
-    lanc[lanc["Tipo"] == "Entrada"]
+rec_cats = (
+    lanc_real[lanc_real["Tipo"] == "Entrada"]
     .groupby("Categoria")["Valor"].sum()
     .pipe(lambda s: s[s > 0].sort_values())
 )
 
 desp_cats = (
-    lanc[lanc["Tipo"] == "Saída"]
+    lanc_real[lanc_real["Tipo"] == "Saída"]
     .groupby("Categoria")["Valor"].sum().abs()
     .pipe(lambda s: s[s > 0].sort_values())
 )
 
 grupo_desp = (
-    lanc[lanc["Tipo"] == "Saída"]
+    lanc_real[lanc_real["Tipo"] == "Saída"]
     .groupby("Grupo DRE")["Valor"].sum().abs()
     .pipe(lambda s: s[s > 0].sort_values(ascending=False))
 )
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
-saldo_atual    = float(monthly.loc[monthly["Saldo Acumulado"] != 0, "Saldo Acumulado"].iloc[-1])
-total_entradas = receita_bruta
-total_saidas   = float(lanc[lanc["Tipo"] == "Saída"]["Valor"].sum())
+_real_saldo  = daily.loc[daily["Saldo Final"] != 0, "Saldo Final"]
+saldo_atual  = float(_real_saldo.iloc[-1]) if len(_real_saldo) else 0.0
+total_saidas = float(lanc_real[lanc_real["Tipo"] == "Saída"]["Valor"].sum())
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 C = dict(
@@ -141,14 +143,19 @@ def plot_base(title=""):
 # ── Static figures ────────────────────────────────────────────────────────────
 mlabels = monthly["Data"].dt.strftime("%b/%y")
 
-# Entradas vs Saídas mensais
 fig_bar = go.Figure([
     go.Bar(x=mlabels, y=monthly["Entradas"], name="Entradas", marker_color=C["green"]),
     go.Bar(x=mlabels, y=monthly["Saídas"],   name="Saídas",   marker_color=C["red"]),
 ])
+fig_bar.update_layout(**plot_base("Entradas vs Saídas por Mês"), barmode="group")
+
+fig_saldo_m = go.Figure(go.Scatter(
+    x=mlabels, y=monthly["Saldo Acumulado"], mode="lines+markers",
+    line=dict(color=C["blue"], width=2), marker=dict(size=6),
+    fill="tozeroy", fillcolor="rgba(59,130,246,0.08)", name="Saldo",
+))
 fig_saldo_m.update_layout(**plot_base("Saldo Acumulado Mensal"))
 
-# DRE Waterfall
 fig_dre = go.Figure(go.Waterfall(
     orientation="v",
     measure=["absolute", "relative", "total", "relative", "total", "relative", "total"],
@@ -164,7 +171,6 @@ fig_dre = go.Figure(go.Waterfall(
 fig_dre.update_layout(**plot_base(f"DRE — Demonstração do Resultado  ({ref_month})"))
 fig_dre.update_layout(margin=dict(l=50, r=70, t=42, b=40), showlegend=False)
 
-# Pie — estrutura de custos
 PIE_COLORS = [C["red"], C["yellow"], C["purple"], C["teal"], C["blue"]]
 fig_pie = go.Figure(go.Pie(
     labels=grupo_desp.index.tolist(),
@@ -184,7 +190,6 @@ fig_pie.update_layout(
     showlegend=True,
 )
 
-# Receitas por categoria
 fig_rec = go.Figure(go.Bar(
     x=rec_cats.values, y=rec_cats.index, orientation="h",
     marker_color=C["green"],
@@ -195,7 +200,6 @@ fig_rec.update_layout(**plot_base("Receitas por Categoria (Realizado)"))
 fig_rec.update_layout(margin=dict(l=210, r=140, t=42, b=40))
 fig_rec.update_yaxes(gridcolor="rgba(0,0,0,0)")
 
-# Despesas por categoria
 fig_desp = go.Figure(go.Bar(
     x=desp_cats.values, y=desp_cats.index, orientation="h",
     marker_color=C["red"],
@@ -206,65 +210,12 @@ fig_desp.update_layout(**plot_base("Despesas por Categoria (Realizado)"))
 fig_desp.update_layout(margin=dict(l=240, r=140, t=42, b=40))
 fig_desp.update_yaxes(gridcolor="rgba(0,0,0,0)")
 
-# Movimentação por banco — construído a partir dos Lançamentos reais
-@callback(
-    Output("daily-graph",     "figure"),
-    Output("daily-bar-graph", "figure"),
-    Input("date-range", "start_date"),
-    Input("date-range", "end_date"),
-)
-def update_daily(start, end):
-    start = start or _d_start
-    end   = end   or _d_end
-
-    d = daily[(daily["Data"] >= start) & (daily["Data"] <= end)]
-    f = forecast[(forecast["Data"] >= start) & (forecast["Data"] <= end)]
-
-    fig_line = go.Figure([
-        go.Scatter(
-            x=d["Data"], y=d["Saldo Final"], mode="lines+markers",
-            name="Realizado", line=dict(color=C["blue"], width=2),
-            marker=dict(size=5),
-        ),
-        go.Scatter(
-            x=f["Data"], y=f["Saldo Final"], mode="lines",
-            name="Forecast", line=dict(color=C["yellow"], width=2, dash="dash"),
-        ),
-    ])
-    fig_line.update_layout(**plot_base("Saldo Final do Dia"))
-
-    fig_fluxo = go.Figure([
-        go.Bar(
-            x=d["Data"], y=d["Fluxo"],
-            name="Realizado", marker_color=C["blue"], opacity=0.85,
-        ),
-        go.Bar(
-            x=f["Data"], y=f["Fluxo"],
-            name="Forecast", marker_color=C["yellow"], opacity=0.65,
-        ),
-    ])
-    fig_fluxo.update_layout(**plot_base("Fluxo do Dia"), barmode="overlay")
-    fig_fluxo.update_traces(
-        selector=dict(name="Realizado"),
-        marker_color=[C["green"] if v >= 0 else C["red"] for v in d["Fluxo"]],
-    )
-
-    return fig_line, fig_fluxo
-fig_bar.update_layout(**plot_base("Entradas vs Saídas por Mês"), barmode="group")
-
-# Saldo acumulado mensal
-fig_saldo_m = go.Figure(go.Scatter(
-    x=mlabels, y=monthly["Saldo Acumulado"], mode="lines+markers",
-    line=dict(color=C["blue"], width=2), marker=dict(size=6),
-    fill="tozeroy", fillcolor="rgba(59,130,246,0.08)", name="Saldo",
-))
 _bank_df = (
-    lanc.groupby([pd.to_datetime(lanc["Mês"]).dt.to_period("M"), "Banco", "Tipo"])["Valor"]
+    lanc_real.groupby([pd.to_datetime(lanc_real["Mês"]).dt.to_period("M"), "Banco", "Tipo"])["Valor"]
     .sum()
     .reset_index()
 )
 _bank_df["Label"] = _bank_df["Mês"].dt.to_timestamp().dt.strftime("%b/%y")
-
 _bank_df["Valor"] = _bank_df["Valor"].abs()
 
 BANK_COLORS = {"Cresol": C["blue"], "Stone": C["teal"]}
@@ -278,15 +229,13 @@ for banco in sorted(_bank_df["Banco"].unique()):
             name=f"{banco} — {tipo}s",
             marker_color=color, opacity=opacity,
         ))
-
-
 fig_bank.update_layout(**plot_base("Movimentação por Banco (Mensal)"), barmode="group")
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
-app   = Dash(__name__)
+app    = Dash(__name__)
 server = app.server
-
 app.title = "Dashboard Financeiro"
-
 
 DIVIDER = {"borderTop": f"1px solid {C['border']}", "margin": "8px 0 20px"}
 
@@ -298,7 +247,7 @@ def kpi_card(title, value, color, subtitle=None, is_percent=False):
                              "margin": "0 0 4px", "fontWeight": "500"}),
         html.H3(fmt, style={"color": color, "margin": 0,
                             "fontSize": "1.3rem", "fontWeight": "700"}),
-        html.P(subtitle or " ", style={"color": C["muted"],
+        html.P(subtitle or " ", style={"color": C["muted"],
                "fontSize": "0.70rem", "margin": "4px 0 0"}),
     ], style={**CARD, "flex": "1", "minWidth": "160px"})
 
@@ -309,16 +258,10 @@ def section_label(text):
         "letterSpacing": "0.09em", "textTransform": "uppercase",
         "margin": "0 0 12px",
     })
-# default date range for daily chart
+
+
 _d_start = str(daily["Data"].min().date())
-
 _d_end   = str(daily["Data"].max().date())
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8050))
-    app.run(debug=False, host="0.0.0.0", port=port)
-
 
 app.layout = html.Div([
 
@@ -347,13 +290,13 @@ app.layout = html.Div([
     # ── KPIs ─────────────────────────────────────────────────────────────────
     section_label("Resultado do Período"),
     html.Div([
-        kpi_card("Receita Bruta",   receita_bruta, C["green"]),
-        kpi_card("Lucro Bruto",     lucro_bruto,   C["blue"],
+        kpi_card("Receita Bruta",  receita_bruta, C["green"]),
+        kpi_card("Lucro Bruto",    lucro_bruto,   C["blue"],
                  f"Margem {margem_bruta:.1f}%"),
-        kpi_card("EBITDA",          ebitda,        C["yellow"]),
-        kpi_card("Lucro Líquido",   lucro_liq,     C["green"],
+        kpi_card("EBITDA",         ebitda,        C["yellow"]),
+        kpi_card("Lucro Líquido",  lucro_liq,     C["green"],
                  f"Margem {margem_liq:.1f}%"),
-        kpi_card("Saldo em Caixa",  saldo_atual,   C["blue"]),
+        kpi_card("Saldo em Caixa", saldo_atual,   C["blue"]),
     ], style={"display": "flex", "gap": "14px", "marginBottom": "28px", "flexWrap": "wrap"}),
 
     html.Hr(style=DIVIDER),
@@ -425,6 +368,7 @@ app.layout = html.Div([
             style={**CARD, "flex": "1"},
         ),
     ], style={"display": "flex", "gap": "16px", "marginBottom": "24px"}),
+
     html.Hr(style=DIVIDER),
 
     # ── Bancos ────────────────────────────────────────────────────────────────
@@ -439,3 +383,53 @@ app.layout = html.Div([
     "fontFamily":  '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
     "boxSizing":   "border-box",
 })
+
+
+@callback(
+    Output("daily-graph",     "figure"),
+    Output("daily-bar-graph", "figure"),
+    Input("date-range", "start_date"),
+    Input("date-range", "end_date"),
+)
+def update_daily(start, end):
+    start = start or _d_start
+    end   = end   or _d_end
+
+    d = daily[(daily["Data"] >= start) & (daily["Data"] <= end)]
+    f = forecast[(forecast["Data"] >= start) & (forecast["Data"] <= end)]
+
+    fig_line = go.Figure([
+        go.Scatter(
+            x=d["Data"], y=d["Saldo Final"], mode="lines+markers",
+            name="Realizado", line=dict(color=C["blue"], width=2),
+            marker=dict(size=5),
+        ),
+        go.Scatter(
+            x=f["Data"], y=f["Saldo Final"], mode="lines",
+            name="Forecast", line=dict(color=C["yellow"], width=2, dash="dash"),
+        ),
+    ])
+    fig_line.update_layout(**plot_base("Saldo Final do Dia"))
+
+    fig_fluxo = go.Figure([
+        go.Bar(
+            x=d["Data"], y=d["Fluxo"],
+            name="Realizado", marker_color=C["blue"], opacity=0.85,
+        ),
+        go.Bar(
+            x=f["Data"], y=f["Fluxo"],
+            name="Forecast", marker_color=C["yellow"], opacity=0.65,
+        ),
+    ])
+    fig_fluxo.update_layout(**plot_base("Fluxo do Dia"), barmode="overlay")
+    fig_fluxo.update_traces(
+        selector=dict(name="Realizado"),
+        marker_color=[C["green"] if v >= 0 else C["red"] for v in d["Fluxo"]],
+    )
+
+    return fig_line, fig_fluxo
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8050))
+    app.run(debug=False, host="0.0.0.0", port=port)
